@@ -85,6 +85,9 @@ export default function App() {
   ];
   const [taskAssignments, setTaskAssignments] = useState<Record<number, number[]>>({});
   const [notifications, setNotifications] = useState<{ id: string; title: string; message: string; type: 'info' | 'success' | 'warning'; persistent?: boolean }[]>([]);
+  const [userFocus, setUserFocus] = useState('');
+  const [selectedFocusIds, setSelectedFocusIds] = useState<number[]>([]);
+  const [now, setNow] = useState(new Date());
 
   const playBeep = () => {
     try {
@@ -140,6 +143,11 @@ export default function App() {
       const data = await res.json();
       setEvents(data);
     }
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -215,22 +223,6 @@ export default function App() {
     setTasks(data);
   };
 
-  // Nightly commitment prompt
-  useEffect(() => {
-    const checkNightly = () => {
-      const now = new Date();
-      if (now.getHours() === 21 && now.getMinutes() === 0) { // 9:00 PM
-        addNotification(
-          "Nightly Commitment",
-          "It's 9:00 PM. What is your primary commitment for tomorrow? Type it in your tasks!",
-          'info',
-          true
-        );
-      }
-    };
-    const interval = setInterval(checkNightly, 60000); // Check every minute
-    return () => clearInterval(interval);
-  }, []);
 
   const handleConnect = async () => {
     const res = await fetch('/api/auth/google/url');
@@ -442,19 +434,61 @@ export default function App() {
     });
   };
 
+
+  const syncFocusToTray = async (ids: number[]) => {
+    try {
+      await fetch('/api/briefing/focus', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ taskIds: ids })
+      });
+    } catch (e) {
+      console.error("Failed to sync focus to tray", e);
+    }
+  };
+
+  const toggleFocusSelection = (taskId: number) => {
+    setSelectedFocusIds(prev => {
+      const isSelected = prev.includes(taskId);
+      let newSelection;
+      if (isSelected) {
+        newSelection = prev.filter(id => id !== taskId);
+      } else {
+        if (prev.length >= 3) return prev; // Limit to 3
+        newSelection = [...prev, taskId];
+      }
+      syncFocusToTray(newSelection);
+      return newSelection;
+    });
+  };
+
   const generateBriefing = async () => {
     setIsLoadingBriefing(true);
     try {
       const topTasks = tasks.slice(0, 3);
-      const data = await generateMorningBriefing(events, topTasks);
+      const data = await generateMorningBriefing(events, topTasks, userFocus);
       setBriefing(data);
 
-      // Show top tasks in persistent notification
+      // Initially select top 3 from AI if not already selected
+      if (selectedFocusIds.length === 0) {
+        const initialIds = data.tasksWithSteps
+          .filter(t => t.taskId && !t.isSuggested)
+          .slice(0, 3)
+          .map(t => t.taskId!) as number[];
+        setSelectedFocusIds(initialIds);
+        syncFocusToTray(initialIds);
+      }
+
+      // Notify tray manager
       const morningTasks = data.tasksWithSteps.slice(0, 3);
       if (morningTasks.length > 0) {
-        const taskList = morningTasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n');
-        addNotification("Today's Focus", taskList, 'info', true);
+        fetch('/api/notifications/briefing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tasks: morningTasks })
+        }).catch(e => console.error("Failed to sync briefing to tray", e));
       }
+
     } catch (e) {
       console.error(e);
     } finally {
@@ -643,7 +677,19 @@ export default function App() {
                 <div className="bg-white rounded-3xl p-8 md:p-12 text-center space-y-8 shadow-sm border border-stone-100">
                   <div className="space-y-4">
                     <h2 className="text-3xl md:text-4xl font-light tracking-tight">Good morning.</h2>
-                    <p className="text-stone-500 text-sm md:text-base">Ready to see what your day looks like?</p>
+                    <p className="text-stone-500 text-sm md:text-base mb-6">Ready to see what your day looks like?</p>
+
+                    <div className="max-w-md mx-auto space-y-4 text-left">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-stone-400 uppercase tracking-widest block px-1">What's your focus for today?</label>
+                        <textarea
+                          value={userFocus}
+                          onChange={(e) => setUserFocus(e.target.value)}
+                          placeholder="e.g. Finish the project proposal, attend the strategy meeting..."
+                          className="w-full p-4 bg-stone-50 border border-stone-100 rounded-[24px] text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20 transition-all resize-none h-28 shadow-inner"
+                        />
+                      </div>
+                    </div>
                   </div>
                   <button
                     onClick={generateBriefing}
@@ -708,7 +754,30 @@ export default function App() {
                               )}
                               <span className="text-amber-500 font-mono text-sm font-bold">0{idx + 1}</span>
                             </div>
-                            <h4 className="text-xl font-semibold text-stone-900">{task.title}</h4>
+                            <div className="flex items-center justify-between gap-4">
+                              <h4 className="text-xl font-semibold text-stone-900">{task.title}</h4>
+                              {task.taskId && (
+                                <button
+                                  onClick={() => toggleFocusSelection(task.taskId!)}
+                                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-bold transition-all shrink-0 ${selectedFocusIds.includes(task.taskId!)
+                                    ? 'bg-amber-500 text-white shadow-lg shadow-amber-200'
+                                    : 'bg-stone-50 text-stone-400 hover:bg-stone-100'
+                                    }`}
+                                >
+                                  {selectedFocusIds.includes(task.taskId!) ? (
+                                    <>
+                                      <Sparkles className="w-3 h-3" />
+                                      <span>Active Focus</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Grid className="w-3 h-3" />
+                                      <span>Set as Focus</span>
+                                    </>
+                                  )}
+                                </button>
+                              )}
+                            </div>
 
                             <div className="flex items-center gap-3">
                               <span className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">Set Priority</span>
@@ -857,18 +926,18 @@ export default function App() {
                       });
 
                       return (
-                        <div key={hour} className="flex group">
+                        <div key={hour} className="flex group relative">
                           <div className="w-20 py-8 pr-4 text-right">
                             <span className="text-[10px] font-bold text-stone-300 uppercase tracking-widest">
                               {format(setHours(new Date(), hour), 'HH:00')}
                             </span>
                           </div>
                           <div className="flex-1 py-4 px-4 relative min-h-[80px] flex gap-3 overflow-x-auto custom-scrollbar">
-                            {hourEvents.map(event => {
+                            {hourEvents.map((event, idx) => {
                               const colors = getAccountColor(event.accountEmail);
                               return (
                                 <div
-                                  key={event.id}
+                                  key={`${event.id}_${idx}`}
                                   onClick={() => setSelectedEvent(event)}
                                   className={`flex-1 min-w-[150px] ${colors.bg} ${colors.border} border-l-4 p-3 rounded-xl hover:translate-y-[-2px] hover:shadow-md transition-all cursor-pointer shadow-sm h-fit`}
                                 >
@@ -880,6 +949,16 @@ export default function App() {
                               );
                             })}
                             <div className="absolute top-0 left-0 right-0 h-px bg-stone-50 opacity-0 group-hover:opacity-100 transition-opacity" />
+
+                            {isSameDay(currentDate, new Date()) && now.getHours() === hour && (
+                              <div
+                                className="absolute left-[-5px] right-0 pointer-events-none z-10 flex items-center"
+                                style={{ top: `${(now.getMinutes() / 60) * 100}%` }}
+                              >
+                                <div className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-sm shadow-red-200" />
+                                <div className="flex-1 h-px bg-red-500 animate-pulse" />
+                              </div>
+                            )}
                           </div>
                         </div>
                       );
@@ -910,14 +989,14 @@ export default function App() {
                             {Array.from({ length: 24 }).map((_, h) => (
                               <div key={h} className="h-20 border-b border-stone-50/50" />
                             ))}
-                            {getEventsWithLayout(events.filter(e => isSameDay(new Date(e.start.dateTime || e.start.date || ''), day))).map(event => {
+                            {getEventsWithLayout(events.filter(e => isSameDay(new Date(e.start.dateTime || e.start.date || ''), day))).map((event, idx) => {
                               const start = new Date(event.start.dateTime || event.start.date || '');
                               const top = start.getHours() * 80 + (start.getMinutes() / 60) * 80;
                               const colors = getAccountColor(event.accountEmail);
                               const layout = (event as any).layout;
                               return (
                                 <div
-                                  key={event.id}
+                                  key={`${event.id}_${idx}`}
                                   onClick={() => setSelectedEvent(event)}
                                   className={`absolute ${colors.light} ${colors.border} border-l-2 rounded-md p-1 overflow-hidden shadow-sm cursor-pointer hover:scale-[1.02] hover:z-10 transition-all`}
                                   style={{
@@ -931,6 +1010,16 @@ export default function App() {
                                 </div>
                               );
                             })}
+
+                            {isToday(day) && (
+                              <div
+                                className="absolute left-[-4px] right-0 pointer-events-none z-10 flex items-center"
+                                style={{ top: `${now.getHours() * 80 + (now.getMinutes() / 60) * 80}px` }}
+                              >
+                                <div className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-sm shadow-red-200" />
+                                <div className="flex-1 h-px bg-red-500 animate-pulse" />
+                              </div>
+                            )}
                           </div>
                         </div>
                       ))}
@@ -1614,7 +1703,7 @@ export default function App() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, scale: 0.9, y: -20 }}
               className={`pointer-events-auto relative overflow-hidden bg-white/90 backdrop-blur-xl border border-stone-200 p-5 rounded-[24px] shadow-2xl ${n.type === 'success' ? 'border-l-4 border-l-green-500' :
-                  n.type === 'warning' ? 'border-l-4 border-l-amber-500' : 'border-l-4 border-l-amber-500'
+                n.type === 'warning' ? 'border-l-4 border-l-amber-500' : 'border-l-4 border-l-amber-500'
                 }`}
             >
               <div className="flex items-start justify-between gap-4">

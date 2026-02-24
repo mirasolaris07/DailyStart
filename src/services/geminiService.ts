@@ -5,20 +5,31 @@ const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || "" }
 
 export async function generateMorningBriefing(
   events: CalendarEvent[],
-  tasks: Task[]
+  tasks: Task[],
+  userFocus: string = ""
 ): Promise<BriefingData> {
   const model = import.meta.env.VITE_GEMINI_MODEL || "gemini-3-flash-preview";
 
   const prompt = `
     You are a supportive morning productivity coach. 
-    Here is the user's schedule for today: ${JSON.stringify(events)}
-    And their top tasks: ${JSON.stringify(tasks)}
+    
+    CRITICAL CONTEXT:
+    1. User's Manual Focus for today: "${userFocus}"
+    2. User's Schedule: ${JSON.stringify(events)}
+    3. Existing Tasks (includes Nightly Commitments): ${JSON.stringify(tasks)}
 
     Please provide:
-    1. A concise summary of their day (meetings and priorities).
+    1. A concise summary of their day (meetings and priorities, emphasizing their stated focus).
     2. A warm, encouraging message to start the day.
-    3. Selection of top 3 tasks from their existing list. For each, provide 3-4 micro-steps and a suggested priority level (1-3). CRITICAL: For these existing tasks, set "isSuggested" to false.
-    4. Suggest 2-3 NEW "proposed tasks" based on their schedule (like "Prepare notes for X meeting" or "Review documents for Y"). For each, provide 3-4 micro-steps and a suggested priority level (1-3). CRITICAL: For these new suggested tasks, set "isSuggested" to true and "taskId" to null.
+    3. Selection of top 3 "Active Focus" tasks. 
+       - Prioritize tasks that match the User's Manual Focus.
+       - Then prioritize tasks described as "Nightly Commitment".
+       - Then pick remaining urgent/important tasks.
+       - For each, provide 3-4 micro-steps and a suggested priority level (1-3). 
+       - CRITICAL: For these existing tasks, set "isSuggested" to false.
+    4. Suggest 2-3 NEW "proposed tasks" only if gaps exist or to help with their stated focus.
+       - For each, provide 3-4 micro-steps and a suggested priority level (1-3). 
+       - CRITICAL: For these new suggested tasks, set "isSuggested" to true and "taskId" to null.
 
     Respond in JSON format.
   `;

@@ -7,6 +7,7 @@ import { google } from "googleapis";
 import cookieParser from "cookie-parser";
 import session from "express-session";
 import dotenv from "dotenv";
+import { generateServerBriefing } from "./serverGemini";
 
 dotenv.config();
 
@@ -43,6 +44,22 @@ db.exec(`
     type TEXT NOT NULL, -- 'work', 'short_break', 'long_break'
     completed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS system_notifications (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL, -- 'morning_briefing', 'nightly_commitment'
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    shown INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS daily_focus (
+    date TEXT PRIMARY KEY,
+    task_ids TEXT NOT NULL, -- JSON array of IDs
+    hash TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
@@ -191,6 +208,108 @@ async function startServer() {
     db.prepare("DELETE FROM connections WHERE email = ?").run(email);
     res.json({ success: true });
   });
+
+  // --- Notification Routes (for System Tray) ---
+  app.post("/api/notifications/briefing", (req, res) => {
+    const { tasks } = req.body;
+    if (!tasks || !Array.isArray(tasks)) return res.status(400).json({ error: "Invalid tasks" });
+
+    const message = tasks.map((t: any, i: number) => `${i + 1}. ${t.title}`).join('\n');
+    const id = `briefing-${new Date().toISOString().split('T')[0]}`;
+
+    db.prepare(`
+      INSERT OR REPLACE INTO system_notifications (id, type, title, message, shown)
+      VALUES (?, ?, ?, ?, 0)
+    `).run(id, 'morning_briefing', "Today's Focus", message);
+
+    res.json({ success: true });
+  });
+
+  app.get("/api/notifications/tray", (req, res) => {
+    const pending = db.prepare("SELECT * FROM system_notifications WHERE shown = 0 ORDER BY created_at ASC").all();
+
+    // Mark them as shown once retrieved by the tray
+    if (pending.length > 0) {
+      const ids = pending.map((p: any) => p.id);
+      db.prepare(`UPDATE system_notifications SET shown = 1 WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+    }
+
+    res.json(pending);
+  });
+
+  app.post("/api/briefing/focus", (req, res) => {
+    const { taskIds } = req.body; // Array of IDs
+    if (!taskIds || !Array.isArray(taskIds)) return res.status(400).json({ error: "Invalid taskIds" });
+
+    const date = new Date().toISOString().split('T')[0];
+    const hash = taskIds.sort().join(',');
+
+    // Check if changed
+    const existing = db.prepare("SELECT hash FROM daily_focus WHERE date = ?").get(date) as any;
+
+    if (!existing || existing.hash !== hash) {
+      db.prepare("INSERT OR REPLACE INTO daily_focus (date, task_ids, hash) VALUES (?, ?, ?)").run(date, JSON.stringify(taskIds), hash);
+
+      // Trigger a new notification for the tray
+      const tasks = db.prepare(`SELECT title FROM tasks WHERE id IN (${taskIds.map(() => '?').join(',')})`).all(...taskIds);
+      const message = tasks.map((t: any, i: number) => `${i + 1}. ${t.title}`).join('\n');
+      const id = `briefing-${date}-${Date.now()}`; // Unique ID to force re-show
+
+      db.prepare(`
+        INSERT INTO system_notifications (id, type, title, message, shown)
+        VALUES (?, ?, ?, ?, 0)
+      `).run(id, 'morning_briefing', "Today's Focus Updated", message);
+    }
+
+    res.json({ success: true });
+  });
+
+  // Proactive Briefing Logic
+  async function initializeDailyBriefing() {
+    const date = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD in local time
+    const existing = db.prepare("SELECT date FROM daily_focus WHERE date = ?").get(date);
+
+    if (!existing) {
+      console.log("Proactively initializing briefing for", date);
+
+      // Fetch tasks for today (including commitments)
+      const tasks = db.prepare("SELECT * FROM tasks WHERE status = 'pending' AND is_hidden = 0").all() as any[];
+
+      // Fetch recent sessions or events? For now, let's use tasks.
+      // We can expand this to fetch calendar events if we want to be more thorough,
+      // but tasks are the core of the morning briefing.
+
+      try {
+        const briefing = await generateServerBriefing([], tasks, "");
+        if (briefing) {
+          console.log("Briefing generated successfully");
+          const taskIds = briefing.tasksWithSteps
+            .map((t: any) => {
+              const matchedTask = tasks.find(actualTask => actualTask.title === t.title);
+              return matchedTask ? matchedTask.id : null;
+            })
+            .filter((id: any) => id !== null);
+
+          const hash = taskIds.sort().join(',');
+          db.prepare("INSERT OR REPLACE INTO daily_focus (date, task_ids, hash) VALUES (?, ?, ?)").run(date, JSON.stringify(taskIds), hash);
+
+          const message = briefing.tasksWithSteps.map((t: any, i: number) => `${i + 1}. ${t.title}`).join('\n');
+          const id = `briefing-${date}`;
+
+          db.prepare(`
+            INSERT OR REPLACE INTO system_notifications (id, type, title, message, shown)
+            VALUES (?, ?, ?, ?, 0)
+          `).run(id, 'morning_briefing', "Good Morning! Today's Focus", message);
+
+          console.log("Proactive briefing notification queued for tray.");
+        }
+      } catch (err) {
+        console.error("Proactive briefing generation failed:", err);
+      }
+    }
+  }
+
+  initializeDailyBriefing();
 
   // Calendar Routes
   app.get("/api/calendar/events", async (req, res) => {
